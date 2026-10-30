@@ -78,24 +78,46 @@ function splitMessage(text, maxLength = 3800) {
   return chunks;
 }
 
+/** Escape dynamic values for Telegram legacy Markdown. */
+function escapeMd(value) {
+  return String(value ?? "").replace(/([_*`\[])/g, "\\$1");
+}
+
+function asSessionList(list) {
+  if (Array.isArray(list)) return list;
+  if (Array.isArray(list?.data)) return list.data;
+  if (Array.isArray(list?.items)) return list.items;
+  return [];
+}
+
+function asModelList(result) {
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result?.data)) return result.data;
+  return [];
+}
+
+function asMessageList(history) {
+  if (Array.isArray(history)) return history;
+  if (Array.isArray(history?.data)) return history.data;
+  if (Array.isArray(history?.messages)) return history.messages;
+  return [];
+}
+
 export default Plugin.define({
   id: "telegram",
   async setup(ctx) {
     debugLog(`setup() for directory: ${ctx.location.directory}`);
 
-    // 每个加载位置都会实例化一次插件；仅主位置启动 Bot（受配置锁单例保护）
-    if (ctx.location.directory !== homedir()) {
-      debugLog(`Skipping bot start for non-home location: ${ctx.location.directory}`);
-      return () => {};
-    }
-
+    // OpenCode 会为每个 location 实例化插件；用文件锁保证全局只跑一个 Bot。
+    // 不再硬编码仅 home —— CLI 只开项目目录时也能启动。
     if (!tryAcquireLock()) {
-      debugLog("Failed to acquire lock: another instance is already running.");
+      debugLog(`Skipping bot start (lock held) for: ${ctx.location.directory}`);
       return () => {};
     }
 
     const config = loadConfig();
     if (!config) {
+      releaseLock();
       debugLog("Skipped: telegram.json is missing or invalid.");
       return () => {};
     }
@@ -105,10 +127,22 @@ export default Plugin.define({
     const allowed = new Set(allowedUsers);
     const chatSessions = new Map(); // chatId -> sessionID
     const sessionToChats = new Map(); // sessionID -> Set<chatId>
-    const sentMessageIds = new Set(); // 已推送到 Telegram 的 assistant 消息 ID（去重）
-    const pendingSend = new Set();
+    const deliveredKeys = new Set(); // 已成功投递的去重键
+    const pendingKeys = new Set(); // 正在投递中的去重键
+    const messagesWithPushedText = new Set(); // 已推送过至少一段 text 的 assistant 消息
+    const pendingPermissions = new Map(); // shortKey -> { sessionID, requestID }
+    let lastViewedSessionID = null;
+    let permSeq = 0;
 
     function bindChat(chatId, sessionID) {
+      const prev = chatSessions.get(chatId);
+      if (prev && prev !== sessionID) {
+        const prevSet = sessionToChats.get(prev);
+        if (prevSet) {
+          prevSet.delete(chatId);
+          if (prevSet.size === 0) sessionToChats.delete(prev);
+        }
+      }
       chatSessions.set(chatId, sessionID);
       if (!sessionToChats.has(sessionID)) sessionToChats.set(sessionID, new Set());
       sessionToChats.get(sessionID).add(chatId);
@@ -116,12 +150,7 @@ export default Plugin.define({
 
     function chatsForSession(sessionID) {
       const set = sessionToChats.get(sessionID);
-      if (set) return [...set];
-      const chats = [];
-      for (const [chatId, sid] of chatSessions) {
-        if (sid === sessionID) chats.push(chatId);
-      }
-      return chats;
+      return set ? [...set] : [];
     }
 
     function extractAssistantText(msg) {
@@ -133,23 +162,31 @@ export default Plugin.define({
       return "";
     }
 
-    // 将一条 assistant 回复推送到所有绑定了该会话的 Telegram 聊天
-    async function pushAssistantToChats(sessionID, msgID, chats) {
-      if (!chats.length) return 0;
-      const lockKey = msgID || sessionID;
-      if (sentMessageIds.has(lockKey) || pendingSend.has(lockKey)) return 0;
-      pendingSend.add(lockKey);
+    function isMessageDeliveredOrPending(msgID) {
+      if (!msgID) return false;
+      if (messagesWithPushedText.has(msgID)) return true;
+      if (deliveredKeys.has(`msg:${msgID}`) || pendingKeys.has(`msg:${msgID}`)) return true;
+      for (const key of pendingKeys) {
+        if (key.startsWith(`${msgID}:`)) return true;
+      }
+      for (const key of deliveredKeys) {
+        if (key.startsWith(`${msgID}:`)) return true;
+      }
+      return false;
+    }
 
+    /** 统一投递：事件路径与 wait 兜底共用 pending/delivered，避免双发。 */
+    async function deliverText(chats, text, lockKey, { messageID } = {}) {
+      if (!chats.length || !text) return 0;
+      if (deliveredKeys.has(lockKey) || pendingKeys.has(lockKey)) return 0;
+      if (messageID && messagesWithPushedText.has(messageID) && lockKey.startsWith("msg:")) {
+        return 0;
+      }
+
+      pendingKeys.add(lockKey);
       try {
-        const history = await ctx.session.context({ sessionID });
-        const messages = Array.isArray(history) ? history : history?.data || history?.messages || [];
-        const msg = msgID
-          ? messages.find((m) => m.id === msgID)
-          : [...messages].reverse().find((m) => m.type === "assistant" && m.time?.completed);
-        const text = extractAssistantText(msg);
-        if (!text) return 0;
+        if (deliveredKeys.has(lockKey)) return 0;
 
-        sentMessageIds.add(lockKey);
         let pushed = 0;
         for (const chatId of chats) {
           for (const chunk of splitMessage(text)) {
@@ -157,11 +194,60 @@ export default Plugin.define({
           }
           pushed++;
         }
-        debugLog(`[push] session=${sessionID.slice(-8)} msg=${(msgID || "?").slice(-8)} chats=${pushed}`);
+
+        deliveredKeys.add(lockKey);
+        if (messageID) messagesWithPushedText.add(messageID);
+        // 防止 Set 无限增长
+        if (deliveredKeys.size > 2000) {
+          const drop = [...deliveredKeys].slice(0, deliveredKeys.size - 1000);
+          for (const k of drop) deliveredKeys.delete(k);
+        }
+        if (messagesWithPushedText.size > 2000) {
+          const drop = [...messagesWithPushedText].slice(0, messagesWithPushedText.size - 1000);
+          for (const k of drop) messagesWithPushedText.delete(k);
+        }
         return pushed;
       } finally {
-        pendingSend.delete(lockKey);
+        pendingKeys.delete(lockKey);
       }
+    }
+
+    async function listRecentSessions({ limit = 10, directory } = {}) {
+      const input = { limit, order: "desc" };
+      if (directory) input.directory = directory;
+      const list = await ctx.session.list(input);
+      return asSessionList(list);
+    }
+
+    async function resolveCurrentSession() {
+      if (lastViewedSessionID) {
+        try {
+          const s = await ctx.session.get({ sessionID: lastViewedSessionID });
+          if (s) return s;
+        } catch (e) {
+          debugLog("get last viewed session error: " + e.message);
+        }
+      }
+
+      // 不限 directory：跨项目取最近更新的会话（更接近「当前窗口」）
+      try {
+        const items = await listRecentSessions({ limit: 1 });
+        if (items[0]) return items[0];
+      } catch (e) {
+        debugLog("list recent sessions error: " + e.message);
+      }
+
+      try {
+        const items = await listRecentSessions({
+          limit: 1,
+          directory: ctx.location.directory,
+        });
+        if (items[0]) return items[0];
+      } catch (e) {
+        debugLog("list location sessions error: " + e.message);
+      }
+
+      return null;
     }
 
     async function getActiveSession(chatId) {
@@ -173,19 +259,16 @@ export default Plugin.define({
         } catch {}
       }
 
-      try {
-        const list = await ctx.session.list({ directory: ctx.location.directory, limit: 1 });
-        const items = list?.data || list?.items || (Array.isArray(list) ? list : []);
-        if (items.length > 0) {
-          sessionID = items[0].id;
-          bindChat(chatId, sessionID);
-          return sessionID;
-        }
-      } catch (e) {
-        debugLog("List sessions error: " + e.message);
+      const current = await resolveCurrentSession();
+      if (current?.id) {
+        bindChat(chatId, current.id);
+        return current.id;
       }
 
-      const created = await ctx.session.create({ title: "Telegram remote session" });
+      const created = await ctx.session.create({
+        title: "Telegram remote session",
+        location: { directory: ctx.location.directory },
+      });
       sessionID = created.id;
       bindChat(chatId, sessionID);
       return sessionID;
@@ -219,8 +302,9 @@ export default Plugin.define({
       const sessionID = chatSessions.get(tgCtx.chat.id) || "(none yet)";
       await tgCtx.reply(
         `🖥 *OpenCode status*\n` +
-          `• Directory: \`${ctx.location.directory}\`\n` +
-          `• Bound session: \`${sessionID}\`\n` +
+          `• Directory: \`${escapeMd(ctx.location.directory)}\`\n` +
+          `• Bound session: \`${escapeMd(sessionID)}\`\n` +
+          `• Last viewed: \`${escapeMd(lastViewedSessionID || "(none)")}\`\n` +
           `• Plugin state: running`,
         { parse_mode: "Markdown" }
       );
@@ -228,9 +312,14 @@ export default Plugin.define({
 
     bot.command("new", async (tgCtx) => {
       try {
-        const created = await ctx.session.create({ title: "Telegram remote session" });
+        const created = await ctx.session.create({
+          title: "Telegram remote session",
+          location: { directory: ctx.location.directory },
+        });
         bindChat(tgCtx.chat.id, created.id);
-        await tgCtx.reply(`✨ New session created: \`${created.id}\``, { parse_mode: "Markdown" });
+        await tgCtx.reply(`✨ New session created: \`${escapeMd(created.id)}\``, {
+          parse_mode: "Markdown",
+        });
       } catch (err) {
         await tgCtx.reply(`❌ Failed to create session: ${err.message}`);
       }
@@ -238,18 +327,18 @@ export default Plugin.define({
 
     bot.command("current", async (tgCtx) => {
       try {
-        const list = await ctx.session.list({ directory: ctx.location.directory, limit: 1 });
-        const items = list?.data || list?.items || (Array.isArray(list) ? list : []);
-        if (items.length === 0) {
+        const current = await resolveCurrentSession();
+        if (!current) {
           return tgCtx.reply("No sessions found.");
         }
-        const current = items[0];
         bindChat(tgCtx.chat.id, current.id);
         const title = current.title || "untitled";
+        const directory = current.location?.directory || ctx.location.directory;
         await tgCtx.reply(
           `🔗 *Attached to the desktop's current window!*\n` +
-            `• Title: *${title}*\n` +
-            `• ID: \`${current.id}\`\n\n` +
+            `• Title: *${escapeMd(title)}*\n` +
+            `• ID: \`${escapeMd(current.id)}\`\n` +
+            `• Directory: \`${escapeMd(directory)}\`\n\n` +
             `Anything you type now continues in that window — and desktop replies are pushed back here.`,
           { parse_mode: "Markdown" }
         );
@@ -262,6 +351,26 @@ export default Plugin.define({
 
     async function getAvailableModels() {
       try {
+        const result = await ctx.model.list();
+        const list = asModelList(result);
+        const models = list
+          .filter((m) => m && m.enabled !== false)
+          .map((m) => {
+            const id = m.modelID || m.id;
+            return {
+              providerID: m.providerID,
+              id,
+              name: m.name || id,
+            };
+          })
+          .filter((m) => m.providerID && m.id);
+        if (models.length > 0) return models;
+      } catch (e) {
+        debugLog("ctx.model.list error: " + e.message);
+      }
+
+      // 回退：从 opencode.json 的 providers.models 覆盖项读取
+      try {
         const raw = readFileSync(join(CONFIG_DIR, "opencode.json"), "utf-8");
         const cfg = JSON.parse(raw);
         const models = [];
@@ -273,14 +382,6 @@ export default Plugin.define({
         if (models.length > 0) return models;
       } catch (e) {
         debugLog("Load models from config error: " + e.message);
-      }
-      try {
-        const list = await ctx.model.list();
-        if (Array.isArray(list) && list.length > 0) {
-          return list.map((m) => ({ providerID: m.providerID, id: m.id, name: m.name || m.id }));
-        }
-      } catch (e) {
-        debugLog("ctx.model.list error: " + e.message);
       }
       return [];
     }
@@ -295,7 +396,6 @@ export default Plugin.define({
       }
       cachedModelList = models;
 
-      // /model <keyword> — 模糊匹配并直接切换
       if (arg) {
         const matched = models.find((m) => m.id.toLowerCase().includes(arg));
         if (!matched) {
@@ -306,18 +406,19 @@ export default Plugin.define({
             sessionID,
             model: { providerID: matched.providerID, id: matched.id },
           });
-          return tgCtx.reply(`✅ Model switched to: \`${matched.id}\``, { parse_mode: "Markdown" });
+          return tgCtx.reply(`✅ Model switched to: \`${escapeMd(matched.id)}\``, {
+            parse_mode: "Markdown",
+          });
         } catch (err) {
           return tgCtx.reply(`❌ Failed to switch model: ${err.message}`);
         }
       }
 
-      // /model — 弹出按钮列表
       const keyboard = new InlineKeyboard();
       let text = "🤖 *Choose a model:*\n\n";
       models.forEach((m, idx) => {
-        const shortName = m.id.split("/").pop() || m.id;
-        text += `${idx + 1}. \`${m.id}\`\n`;
+        const shortName = (m.id.split("/").pop() || m.id).slice(0, 64);
+        text += `${idx + 1}. \`${escapeMd(m.id)}\`\n`;
         keyboard.text(shortName, `m:${idx}`);
         if ((idx + 1) % 2 === 0) keyboard.row();
       });
@@ -326,8 +427,13 @@ export default Plugin.define({
 
     bot.command("sessions", async (tgCtx) => {
       try {
-        const list = await ctx.session.list({ directory: ctx.location.directory, limit: 10 });
-        const items = list?.data || list?.items || (Array.isArray(list) ? list : []);
+        let items = await listRecentSessions({ limit: 10 });
+        if (items.length === 0) {
+          items = await listRecentSessions({
+            limit: 10,
+            directory: ctx.location.directory,
+          });
+        }
         if (items.length === 0) {
           return tgCtx.reply("No sessions yet. Send /new to create one.");
         }
@@ -340,7 +446,7 @@ export default Plugin.define({
           const isCurrent = s.id === currentId;
           const marker = isCurrent ? " *(bound)*" : "";
           const title = s.title || "untitled";
-          message += `• \`${s.id.slice(0, 8)}\` ${title}${marker}\n`;
+          message += `• \`${escapeMd(s.id.slice(0, 8))}\` ${escapeMd(title)}${marker}\n`;
           if (!isCurrent) {
             keyboard.text(`Switch: ${title.slice(0, 20)}`, `switch:${s.id}`).row();
           }
@@ -370,12 +476,15 @@ export default Plugin.define({
 
     bot.on("callback_query:data", async (tgCtx) => {
       const data = tgCtx.callbackQuery.data;
+
       if (data.startsWith("switch:")) {
         const targetId = data.slice("switch:".length);
         bindChat(tgCtx.chat.id, targetId);
         await tgCtx.answerCallbackQuery({ text: "Session switched" });
-        await tgCtx.reply(`🔄 Switched to session: \`${targetId}\``, { parse_mode: "Markdown" });
-        await tgCtx.editMessageReplyMarkup({ reply_markup: undefined });
+        await tgCtx.reply(`🔄 Switched to session: \`${escapeMd(targetId)}\``, {
+          parse_mode: "Markdown",
+        });
+        await tgCtx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
         return;
       }
 
@@ -397,11 +506,41 @@ export default Plugin.define({
             model: { providerID: selected.providerID, id: selected.id },
           });
           await tgCtx.answerCallbackQuery({ text: `Switched to ${selected.id}` });
-          await tgCtx.reply(`✅ Model switched to: \`${selected.id}\``, { parse_mode: "Markdown" });
-          await tgCtx.editMessageReplyMarkup({ reply_markup: undefined });
+          await tgCtx.reply(`✅ Model switched to: \`${escapeMd(selected.id)}\``, {
+            parse_mode: "Markdown",
+          });
+          await tgCtx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
         } catch (err) {
           await tgCtx.answerCallbackQuery({ text: "Switch failed" });
           await tgCtx.reply(`❌ Failed to switch model: ${err.message}`);
+        }
+        return;
+      }
+
+      if (data.startsWith("perm:")) {
+        // perm:<decision>:<shortKey>
+        const parts = data.split(":");
+        const decision = parts[1];
+        const shortKey = parts[2];
+        const pending = pendingPermissions.get(shortKey);
+        if (!pending || !["once", "always", "reject"].includes(decision)) {
+          return tgCtx.answerCallbackQuery({ text: "Permission expired" });
+        }
+        pendingPermissions.delete(shortKey);
+        try {
+          await ctx.permission.reply({
+            sessionID: pending.sessionID,
+            requestID: pending.requestID,
+            decision,
+          });
+          await tgCtx.answerCallbackQuery({ text: `Permission: ${decision}` });
+          await tgCtx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+          await tgCtx.reply(`🔐 Permission *${escapeMd(decision)}* for \`${escapeMd(pending.requestID)}\``, {
+            parse_mode: "Markdown",
+          });
+        } catch (err) {
+          await tgCtx.answerCallbackQuery({ text: "Reply failed" });
+          await tgCtx.reply(`❌ Failed to reply to permission: ${err.message}`);
         }
         return;
       }
@@ -432,9 +571,9 @@ export default Plugin.define({
         clearInterval(typingInterval);
         typingInterval = null;
 
-        // 正常情况下回复已由事件流推送；此处为兜底（事件订阅路径失效时仍可回复）
+        // 正常情况下回复已由事件流按 text 段推送；此处为兜底
         const history = await ctx.session.context({ sessionID });
-        const messages = Array.isArray(history) ? history : history?.data || history?.messages || [];
+        const messages = asMessageList(history);
         debugLog(`[reply] context messages=${messages.length}`);
 
         let replyMsg = null;
@@ -445,18 +584,16 @@ export default Plugin.define({
             break;
           }
         }
-        const replyContent = extractAssistantText(replyMsg) || "(no text response)";
         const msgID = replyMsg?.id || "";
-        if (msgID && sentMessageIds.has(msgID)) {
+        if (msgID && isMessageDeliveredOrPending(msgID)) {
           debugLog(`[reply] already pushed by event path, msg=${msgID.slice(-8)}`);
           return;
         }
 
-        const chunks = splitMessage(replyContent);
-        for (const chunk of chunks) {
-          await tgCtx.reply(chunk);
-        }
-        if (msgID) sentMessageIds.add(msgID);
+        const replyContent = extractAssistantText(replyMsg) || "(no text response)";
+        const lockKey = msgID ? `msg:${msgID}` : `fallback:${sessionID}:${Date.now()}`;
+        const chats = [chatId];
+        await deliverText(chats, replyContent, lockKey, { messageID: msgID || undefined });
       } catch (err) {
         if (typingInterval) clearInterval(typingInterval);
         debugLog("Prompt execution error: " + err.message);
@@ -464,23 +601,98 @@ export default Plugin.define({
       }
     });
 
-    // ---- 订阅 OpenCode 事件流：把桌面端产生的回复实时推送到绑定的聊天 ----
+    // ---- 订阅 OpenCode 事件流 ----
     const eventController = new AbortController();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({
-          types: ["session.text.ended"],
+          types: ["session.text.ended", "session.viewed", "permission.asked"],
           signal: eventController.signal,
         })) {
           try {
+            const type = event?.type;
             const d = event?.data ?? event?.properties ?? event;
-            const sessionID = d?.sessionID;
-            const msgID = d?.assistantMessageID || d?.messageID;
-            if (!sessionID) continue;
-            const chats = chatsForSession(sessionID);
-            if (chats.length === 0) continue;
-            debugLog(`[event] session.text.ended session=${sessionID.slice(-8)} msg=${(msgID || "?").slice(-8)} chats=${chats.length}`);
-            await pushAssistantToChats(sessionID, msgID, chats);
+
+            if (type === "session.viewed") {
+              if (d?.sessionID) {
+                lastViewedSessionID = d.sessionID;
+                debugLog(`[event] session.viewed ${String(d.sessionID).slice(-8)}`);
+              }
+              continue;
+            }
+
+            if (type === "permission.asked") {
+              const sessionID = d?.sessionID;
+              const requestID = d?.id;
+              if (!sessionID || !requestID) continue;
+              const chats = chatsForSession(sessionID);
+              if (chats.length === 0) continue;
+
+              permSeq = (permSeq + 1) % 100000;
+              const shortKey = String(permSeq);
+              pendingPermissions.set(shortKey, { sessionID, requestID });
+
+              const action = d.action || "permission";
+              const resources = Array.isArray(d.resources) ? d.resources.join(", ") : "";
+              const message = d.message ? `\n${d.message}` : "";
+              const keyboard = new InlineKeyboard()
+                .text("Allow once", `perm:once:${shortKey}`)
+                .text("Always", `perm:always:${shortKey}`)
+                .row()
+                .text("Reject", `perm:reject:${shortKey}`);
+
+              const body =
+                `🔐 *Permission requested*\n` +
+                `• Action: \`${escapeMd(action)}\`\n` +
+                (resources ? `• Resources: \`${escapeMd(resources.slice(0, 200))}\`\n` : "") +
+                `• Session: \`${escapeMd(sessionID)}\`` +
+                (message ? `\n${escapeMd(message)}` : "");
+
+              for (const chatId of chats) {
+                await bot.api
+                  .sendMessage(chatId, body, {
+                    parse_mode: "Markdown",
+                    reply_markup: keyboard,
+                  })
+                  .catch((e) => debugLog("permission notify error: " + e.message));
+              }
+              continue;
+            }
+
+            if (type === "session.text.ended") {
+              const sessionID = d?.sessionID;
+              const msgID = d?.assistantMessageID || d?.messageID;
+              const ordinal = d?.ordinal;
+              const text = typeof d?.text === "string" ? d.text : "";
+              if (!sessionID) continue;
+              const chats = chatsForSession(sessionID);
+              if (chats.length === 0) continue;
+
+              debugLog(
+                `[event] session.text.ended session=${sessionID.slice(-8)} msg=${(msgID || "?").slice(-8)} ord=${ordinal ?? "?"} chats=${chats.length}`
+              );
+
+              // 优先用事件自带 text；按 msgID:ordinal 去重，允许多段 text 全部送达
+              if (text) {
+                const lockKey =
+                  msgID != null && ordinal != null
+                    ? `${msgID}:${ordinal}`
+                    : msgID
+                      ? `${msgID}:0`
+                      : `session:${sessionID}:${Date.now()}`;
+                await deliverText(chats, text, lockKey, { messageID: msgID || undefined });
+                continue;
+              }
+
+              // 事件无 text 时再查 context（兼容旧事件形状）
+              if (!msgID || isMessageDeliveredOrPending(msgID)) continue;
+              const history = await ctx.session.context({ sessionID });
+              const messages = asMessageList(history);
+              const msg = messages.find((m) => m.id === msgID);
+              const fallbackText = extractAssistantText(msg);
+              if (!fallbackText) continue;
+              await deliverText(chats, fallbackText, `msg:${msgID}`, { messageID: msgID });
+            }
           } catch (e) {
             debugLog("event dispatch error: " + e.message);
           }
@@ -490,15 +702,17 @@ export default Plugin.define({
       }
     })();
 
-    debugLog("Starting Telegram Bot polling (primary instance)...");
-    bot.start({
-      drop_pending_updates: false,
-      onStart: (botInfo) => {
-        debugLog(`Bot @${botInfo.username} polling active!`);
-      },
-    }).catch((err) => {
-      debugLog("Bot polling error: " + (err.stack || err.message));
-    });
+    debugLog(`Starting Telegram Bot polling (primary @ ${ctx.location.directory})...`);
+    bot
+      .start({
+        drop_pending_updates: true,
+        onStart: (botInfo) => {
+          debugLog(`Bot @${botInfo.username} polling active!`);
+        },
+      })
+      .catch((err) => {
+        debugLog("Bot polling error: " + (err.stack || err.message));
+      });
 
     return async () => {
       debugLog("Stopping Telegram Bot...");
