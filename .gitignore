@@ -1,0 +1,5 @@
+node_modules/
+*.log
+telegram.json
+.DS_Store
+.env
