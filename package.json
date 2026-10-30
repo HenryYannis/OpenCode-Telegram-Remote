@@ -10,7 +10,7 @@
   "files": ["src", "README.md", "LICENSE"],
   "scripts": {
     "check": "node --check src/index.js && node --check src/util.js",
-    "test": "node --test test/**/*.test.js",
+    "test": "node --test test/*.test.js",
     "validate": "node scripts/validate-package.mjs",
     "smoke": "node scripts/smoke.mjs",
     "pack:dry-run": "npm pack --dry-run",
