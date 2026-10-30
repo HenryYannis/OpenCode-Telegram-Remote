@@ -128,4 +128,4 @@ npm run ci   # 語法檢查、單元測試、外掛套件驗證、匯入冒煙�
 
 ## 授權
 
-MIT © Henry Yannis
+[MIT](LICENSE) © 2026 程小宝

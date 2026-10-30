@@ -128,4 +128,4 @@ npm run ci   # syntax check, unit tests, package validation, smoke import, pack 
 
 ## License
 
-MIT © Henry Yannis
+[MIT](LICENSE) © 2026 Henry Yannis
