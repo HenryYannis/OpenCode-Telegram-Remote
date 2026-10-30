@@ -1,13 +1,17 @@
 {
   "name": "opencode-telegram-remote",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Telegram remote control for OpenCode (V2 plugin): chat with any window from your phone, switch models & sessions, and get desktop replies pushed back in real time.",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js"
   },
-  "files": ["src", "README.md", "LICENSE"],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "check": "node --check src/index.js && node --check src/util.js",
     "test": "node --test test/*.test.js",
