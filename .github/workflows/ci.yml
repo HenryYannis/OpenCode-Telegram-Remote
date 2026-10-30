@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,14 +20,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # package engines: node >=20; cover LTS current + previous
-        node: [20, 22]
+        # package engines: node >=20
+        node: [20, 22, 24]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
