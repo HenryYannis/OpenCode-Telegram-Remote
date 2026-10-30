@@ -3,6 +3,16 @@ import { Bot, InlineKeyboard } from "grammy";
 import { readFileSync, writeFileSync, unlinkSync, existsSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+  asMessageList,
+  asSessionList,
+  createDeliveryTracker,
+  createSessionBindings,
+  escapeMd,
+  normalizeModels,
+  splitMessage,
+  textEndedLockKey,
+} from "./util.js";
 
 const CONFIG_DIR = join(homedir(), ".config", "opencode");
 const LOG_FILE = process.env.TELEGRAM_PLUGIN_DEBUG
@@ -61,48 +71,6 @@ function loadConfig() {
   }
 }
 
-function splitMessage(text, maxLength = 3800) {
-  if (text.length <= maxLength) return [text];
-  const chunks = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      chunks.push(remaining);
-      break;
-    }
-    let sliceIndex = remaining.lastIndexOf("\n", maxLength);
-    if (sliceIndex === -1 || sliceIndex < maxLength / 2) sliceIndex = maxLength;
-    chunks.push(remaining.slice(0, sliceIndex));
-    remaining = remaining.slice(sliceIndex).trimStart();
-  }
-  return chunks;
-}
-
-/** Escape dynamic values for Telegram legacy Markdown. */
-function escapeMd(value) {
-  return String(value ?? "").replace(/([_*`\[])/g, "\\$1");
-}
-
-function asSessionList(list) {
-  if (Array.isArray(list)) return list;
-  if (Array.isArray(list?.data)) return list.data;
-  if (Array.isArray(list?.items)) return list.items;
-  return [];
-}
-
-function asModelList(result) {
-  if (Array.isArray(result)) return result;
-  if (Array.isArray(result?.data)) return result.data;
-  return [];
-}
-
-function asMessageList(history) {
-  if (Array.isArray(history)) return history;
-  if (Array.isArray(history?.data)) return history.data;
-  if (Array.isArray(history?.messages)) return history.messages;
-  return [];
-}
-
 export default Plugin.define({
   id: "telegram",
   async setup(ctx) {
@@ -125,33 +93,11 @@ export default Plugin.define({
     const { token, allowedUsers } = config;
     const bot = new Bot(token);
     const allowed = new Set(allowedUsers);
-    const chatSessions = new Map(); // chatId -> sessionID
-    const sessionToChats = new Map(); // sessionID -> Set<chatId>
-    const deliveredKeys = new Set(); // 已成功投递的去重键
-    const pendingKeys = new Set(); // 正在投递中的去重键
-    const messagesWithPushedText = new Set(); // 已推送过至少一段 text 的 assistant 消息
+    const { bindChat, chatsForSession, sessionForChat } = createSessionBindings();
+    const delivery = createDeliveryTracker();
     const pendingPermissions = new Map(); // shortKey -> { sessionID, requestID }
     let lastViewedSessionID = null;
     let permSeq = 0;
-
-    function bindChat(chatId, sessionID) {
-      const prev = chatSessions.get(chatId);
-      if (prev && prev !== sessionID) {
-        const prevSet = sessionToChats.get(prev);
-        if (prevSet) {
-          prevSet.delete(chatId);
-          if (prevSet.size === 0) sessionToChats.delete(prev);
-        }
-      }
-      chatSessions.set(chatId, sessionID);
-      if (!sessionToChats.has(sessionID)) sessionToChats.set(sessionID, new Set());
-      sessionToChats.get(sessionID).add(chatId);
-    }
-
-    function chatsForSession(sessionID) {
-      const set = sessionToChats.get(sessionID);
-      return set ? [...set] : [];
-    }
 
     function extractAssistantText(msg) {
       if (!msg) return "";
@@ -162,30 +108,16 @@ export default Plugin.define({
       return "";
     }
 
-    function isMessageDeliveredOrPending(msgID) {
-      if (!msgID) return false;
-      if (messagesWithPushedText.has(msgID)) return true;
-      if (deliveredKeys.has(`msg:${msgID}`) || pendingKeys.has(`msg:${msgID}`)) return true;
-      for (const key of pendingKeys) {
-        if (key.startsWith(`${msgID}:`)) return true;
-      }
-      for (const key of deliveredKeys) {
-        if (key.startsWith(`${msgID}:`)) return true;
-      }
-      return false;
-    }
-
     /** 统一投递：事件路径与 wait 兜底共用 pending/delivered，避免双发。 */
     async function deliverText(chats, text, lockKey, { messageID } = {}) {
-      if (!chats.length || !text) return 0;
-      if (deliveredKeys.has(lockKey) || pendingKeys.has(lockKey)) return 0;
-      if (messageID && messagesWithPushedText.has(messageID) && lockKey.startsWith("msg:")) {
+      if (!chats.length || !text || !lockKey) return 0;
+      if (messageID && delivery.messagesWithPushedText.has(messageID) && lockKey.startsWith("msg:")) {
         return 0;
       }
+      if (!delivery.tryBegin(lockKey)) return 0;
 
-      pendingKeys.add(lockKey);
       try {
-        if (deliveredKeys.has(lockKey)) return 0;
+        if (delivery.deliveredKeys.has(lockKey)) return 0;
 
         let pushed = 0;
         for (const chatId of chats) {
@@ -195,20 +127,10 @@ export default Plugin.define({
           pushed++;
         }
 
-        deliveredKeys.add(lockKey);
-        if (messageID) messagesWithPushedText.add(messageID);
-        // 防止 Set 无限增长
-        if (deliveredKeys.size > 2000) {
-          const drop = [...deliveredKeys].slice(0, deliveredKeys.size - 1000);
-          for (const k of drop) deliveredKeys.delete(k);
-        }
-        if (messagesWithPushedText.size > 2000) {
-          const drop = [...messagesWithPushedText].slice(0, messagesWithPushedText.size - 1000);
-          for (const k of drop) messagesWithPushedText.delete(k);
-        }
+        delivery.markDelivered(lockKey, messageID);
         return pushed;
       } finally {
-        pendingKeys.delete(lockKey);
+        delivery.end(lockKey);
       }
     }
 
@@ -251,7 +173,7 @@ export default Plugin.define({
     }
 
     async function getActiveSession(chatId) {
-      let sessionID = chatSessions.get(chatId);
+      let sessionID = sessionForChat(chatId);
       if (sessionID) {
         try {
           const s = await ctx.session.get({ sessionID });
@@ -299,7 +221,7 @@ export default Plugin.define({
     });
 
     bot.command("status", async (tgCtx) => {
-      const sessionID = chatSessions.get(tgCtx.chat.id) || "(none yet)";
+      const sessionID = sessionForChat(tgCtx.chat.id) || "(none yet)";
       await tgCtx.reply(
         `🖥 *OpenCode status*\n` +
           `• Directory: \`${escapeMd(ctx.location.directory)}\`\n` +
@@ -351,19 +273,7 @@ export default Plugin.define({
 
     async function getAvailableModels() {
       try {
-        const result = await ctx.model.list();
-        const list = asModelList(result);
-        const models = list
-          .filter((m) => m && m.enabled !== false)
-          .map((m) => {
-            const id = m.modelID || m.id;
-            return {
-              providerID: m.providerID,
-              id,
-              name: m.name || id,
-            };
-          })
-          .filter((m) => m.providerID && m.id);
+        const models = normalizeModels(await ctx.model.list());
         if (models.length > 0) return models;
       } catch (e) {
         debugLog("ctx.model.list error: " + e.message);
@@ -438,7 +348,7 @@ export default Plugin.define({
           return tgCtx.reply("No sessions yet. Send /new to create one.");
         }
 
-        const currentId = chatSessions.get(tgCtx.chat.id);
+        const currentId = sessionForChat(tgCtx.chat.id);
         const keyboard = new InlineKeyboard();
         let message = "📋 *Sessions:*\n\n";
 
@@ -462,7 +372,7 @@ export default Plugin.define({
     });
 
     bot.command("abort", async (tgCtx) => {
-      const sessionID = chatSessions.get(tgCtx.chat.id);
+      const sessionID = sessionForChat(tgCtx.chat.id);
       if (!sessionID) {
         return tgCtx.reply("No bound session.");
       }
@@ -585,7 +495,7 @@ export default Plugin.define({
           }
         }
         const msgID = replyMsg?.id || "";
-        if (msgID && isMessageDeliveredOrPending(msgID)) {
+        if (msgID && delivery.isMessageDeliveredOrPending(msgID)) {
           debugLog(`[reply] already pushed by event path, msg=${msgID.slice(-8)}`);
           return;
         }
@@ -675,17 +585,13 @@ export default Plugin.define({
               // 优先用事件自带 text；按 msgID:ordinal 去重，允许多段 text 全部送达
               if (text) {
                 const lockKey =
-                  msgID != null && ordinal != null
-                    ? `${msgID}:${ordinal}`
-                    : msgID
-                      ? `${msgID}:0`
-                      : `session:${sessionID}:${Date.now()}`;
+                  textEndedLockKey(msgID, ordinal) || `session:${sessionID}:${Date.now()}`;
                 await deliverText(chats, text, lockKey, { messageID: msgID || undefined });
                 continue;
               }
 
               // 事件无 text 时再查 context（兼容旧事件形状）
-              if (!msgID || isMessageDeliveredOrPending(msgID)) continue;
+              if (!msgID || delivery.isMessageDeliveredOrPending(msgID)) continue;
               const history = await ctx.session.context({ sessionID });
               const messages = asMessageList(history);
               const msg = messages.find((m) => m.id === msgID);
